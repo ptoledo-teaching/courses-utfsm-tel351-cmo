@@ -1,0 +1,299 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: TEL351 CMO - Measure and monitor the cost of processing telemetry files.
+Resources:
+  Bucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault: {SSEAlgorithm: AES256}
+      OwnershipControls:
+        Rules:
+          - ObjectOwnership: BucketOwnerEnforced
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+  ProcessorLogs:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${AWS::StackName}-processor'
+      RetentionInDays: 7
+  GeneratorLogs:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${AWS::StackName}-generator'
+      RetentionInDays: 7
+  ProcessorRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: {Service: lambda.amazonaws.com}
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: ProcessorAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: [logs:CreateLogStream, logs:PutLogEvents]
+                Resource: !GetAtt ProcessorLogs.Arn
+              - Effect: Allow
+                Action: s3:GetObject
+                Resource: !Sub '${Bucket.Arn}/runs/*/inputs/*'
+              - Effect: Allow
+                Action: s3:PutObject
+                Resource: !Sub '${Bucket.Arn}/runs/*/results/*'
+  GeneratorRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: {Service: lambda.amazonaws.com}
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: GeneratorAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: [logs:CreateLogStream, logs:PutLogEvents]
+                Resource: !GetAtt GeneratorLogs.Arn
+              - Effect: Allow
+                Action: s3:PutObject
+                Resource:
+                  - !Sub '${Bucket.Arn}/runs/*/inputs/*'
+                  - !Sub '${Bucket.Arn}/runs/*/manifest.json'
+                  - !Sub '${Bucket.Arn}/runs/*/summary.json'
+                  - !Sub '${Bucket.Arn}/runs/*/*.csv'
+              - Effect: Allow
+                Action: s3:GetObject
+                Resource: !Sub '${Bucket.Arn}/runs/*/manifest.json'
+              - Effect: Allow
+                Action: logs:FilterLogEvents
+                Resource: !GetAtt ProcessorLogs.Arn
+              - Effect: Allow
+                Action: lambda:InvokeFunction
+                Resource: !GetAtt Processor.Arn
+  Processor:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${AWS::StackName}-processor'
+      Runtime: python3.13
+      Architectures: [arm64]
+      Handler: index.handler
+      Role: !GetAtt ProcessorRole.Arn
+      LoggingConfig:
+        LogFormat: Text
+        LogGroup: !Ref ProcessorLogs
+      MemorySize: 512
+      Timeout: 15
+      Environment:
+        Variables:
+          RESULTS_BUCKET: !Ref Bucket
+          REUSE_INPUT_AT: 'none'
+      Code:
+        ZipFile: |
+          import hashlib
+          import json
+          import os
+          import re
+
+          import boto3
+
+          s3 = boto3.client("s3")
+          bucket = os.environ["RESULTS_BUCKET"]
+
+
+          def handler(event, context):
+              run, file = event["runId"], event["fileId"]
+              if not re.fullmatch("[a-f0-9]{32}", run) or file not in ("A", "B", "C", "D", "E"):
+                  raise ValueError("Unknown run or file")
+              prefix = f"runs/{run}/"
+              row = {"runId": run, "fileId": file, "requestId": context.aws_request_id, "storageReads": 0, "bytesRead": 0}
+              try:
+                  stages = ("validation", "summary", "integrity")
+                  setting, reads = os.environ["REUSE_INPUT_AT"], event["reads"]
+                  if setting not in ("none", *stages) or not isinstance(reads, list) or len(reads) != 3 or any(type(n) is not int or not 0 <= n <= 3 for n in reads):
+                      raise ValueError("Invalid processing configuration")
+                  row.update(reuseAt=setting, loadReads=0, validationReads=0, summaryReads=0, integrityReads=0)
+
+                  def fetch(stage):
+                      with s3.get_object(Bucket=bucket, Key=prefix + f"inputs/{file}.json")["Body"] as stream:
+                          data = stream.read()
+                      row["storageReads"] += 1
+                      row[stage + "Reads"] += 1
+                      row["bytesRead"] += len(data)
+                      return data
+
+                  body = fetch("load")
+
+                  def source(stage, extra):
+                      data = body
+                      if setting != stage:
+                          for _ in range(extra):
+                              data = fetch(stage)
+                      return data
+
+                  record = json.loads(source("validation", reads[0]))
+                  if record["station"] != file or not record["samples"] or not all(type(x) is int for x in record["samples"]):
+                      raise ValueError("Invalid telemetry")
+                  samples = json.loads(source("summary", reads[1]))["samples"]
+                  digest = hashlib.sha256(source("integrity", reads[2])).hexdigest()
+                  if digest != event["inputDigest"]:
+                      raise ValueError("Input checksum mismatch")
+                  summary = {"station": file, "recordsProcessed": len(samples), "total": sum(samples), "inputDigest": digest}
+                  output = json.dumps(summary, sort_keys=True, separators=(",", ":")).encode()
+                  s3.put_object(Bucket=bucket, Key=prefix + f"results/{file}.json", Body=output, ContentType="application/json")
+                  row.update(outcome="COMPLETED", inputBytes=len(body), recordsProcessed=len(samples), inputDigest=digest,
+                             resultDigest=hashlib.sha256(output).hexdigest(), resultObjectBytes=len(output))
+              except Exception:
+                  row["outcome"] = "FAILED"
+                  raise
+              finally:
+                  print(json.dumps({"event": "file_processed", **row}))
+              return row
+  Generator:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${AWS::StackName}-generator'
+      Runtime: python3.13
+      Architectures: [arm64]
+      Handler: index.handler
+      Role: !GetAtt GeneratorRole.Arn
+      LoggingConfig:
+        LogFormat: Text
+        LogGroup: !Ref GeneratorLogs
+      MemorySize: 512
+      Timeout: 180
+      Environment:
+        Variables:
+          RESULTS_BUCKET: !Ref Bucket
+          PROCESSOR: !Ref Processor
+          PROCESSOR_LOG_GROUP: !Ref ProcessorLogs
+      Code:
+        ZipFile: |
+          import csv
+          import hashlib
+          import io
+          import json
+          import os
+          import re
+          import time
+          import uuid
+
+          import boto3
+          from botocore.config import Config
+          from botocore.exceptions import BotoCoreError, ClientError
+
+          s3 = boto3.client("s3")
+          logs = boto3.client("logs")
+          functions = boto3.client("lambda", config=Config(retries={"total_max_attempts": 1}, read_timeout=20))
+          bucket = os.environ["RESULTS_BUCKET"]
+          files = "ABCDE"
+          fields = "runId fileId requestId outcome recordsProcessed inputDigest resultDigest storageReads loadReads validationReads summaryReads integrityReads inputBytes bytesRead resultObjectBytes billedDurationMs memoryMB".split()
+
+
+          def put(key, body, mime="application/json"):
+              s3.put_object(Bucket=bucket, Key=key, Body=body, ContentType=mime)
+
+
+          def _layout(account, i):
+              k = int(hashlib.sha256(account.encode("ascii")).hexdigest(), 16) % 6
+              return (i+1)*(4096+97*k), [int("1020003010"[5*(k%2)+i])*(j==k//2) for j in range(3)]
+
+
+          def generate(account):
+              run = uuid.uuid4().hex
+              prefix = f"runs/{run}/"
+              manifest = {"runId": run, "startMs": int(time.time() * 1000), "rows": []}
+              for i, file in enumerate(files, 1):
+                  size, reads = _layout(account, i-1)
+                  body = json.dumps({"station": file, "samples": [(i * j) % 997 for j in range(size)]}, separators=(",", ":")).encode()
+                  put(prefix + f"inputs/{file}.json", body)
+                  try:
+                      work = {"runId": run, "fileId": file, "reads": reads, "inputDigest": hashlib.sha256(body).hexdigest()}
+                      response = functions.invoke(FunctionName=os.environ["PROCESSOR"], Payload=json.dumps(work).encode())
+                      row = json.load(response["Payload"])
+                      if response.get("FunctionError") or row.get("outcome") != "COMPLETED":
+                          raise ValueError("Processor failed")
+                  except (BotoCoreError, ClientError, ValueError):
+                      row = {"runId": run, "fileId": file, "outcome": "FAILED"}
+                  manifest["rows"].append(row)
+              manifest["endMs"] = int(time.time() * 1000)
+              put(prefix + "manifest.json", json.dumps(manifest).encode())
+              return {"runId": run, "accepted": len(files), "completed": sum(r["outcome"] == "COMPLETED" for r in manifest["rows"])}
+
+
+          def export(rows, columns):
+              out = io.StringIO()
+              writer = csv.DictWriter(out, fieldnames=columns, extrasaction="ignore")
+              writer.writeheader()
+              writer.writerows(rows)
+              return out.getvalue().encode()
+
+
+          def summary(run):
+              prefix = f"runs/{run}/"
+              m = json.load(s3.get_object(Bucket=bucket, Key=prefix + "manifest.json")["Body"])
+              rows = m["rows"]
+              for r in rows:
+                  r.update(memoryMB=None, billedDurationMs=None)
+                  if not r.get("requestId"):
+                      continue
+                  pages = logs.get_paginator("filter_log_events").paginate(logGroupName=os.environ["PROCESSOR_LOG_GROUP"],
+                      startTime=m["startMs"] - 3000, endTime=m["endMs"] + 10000, filterPattern='"REPORT" "' + r["requestId"] + '"')
+                  for page in pages:
+                      for e in page["events"]:
+                          match = re.search(r'REPORT RequestId:\s*(\S+).*?Billed Duration:\s*(\d+) ms.*?Memory Size:\s*(\d+) MB', e["message"])
+                          if match and match[1] == r["requestId"]:
+                              r.update(billedDurationMs=int(match[2]), memoryMB=int(match[3]))
+              completed = sum(r["outcome"] == "COMPLETED" for r in rows)
+              result = {"runId": run, "bucket": bucket, "prefix": prefix, "completed": completed, "failed": len(rows) - completed,
+                        "pending": 0, "measurementStatus": "COMPLETE" if all(r["billedDurationMs"] is not None for r in rows) else "PARTIAL",
+                        "measurements": rows}
+              put(prefix + "measurements.csv", export(rows, fields), "text/csv")
+              put(prefix + "invocations.csv", export(rows, ["runId", "fileId", "requestId", "outcome", "billedDurationMs", "memoryMB"]), "text/csv")
+              put(prefix + "summary.json", json.dumps(result).encode())
+              return result
+
+
+          def handler(event, context):
+              if event == {"action": "generate", "scenario": "baseline", "files": 5}:
+                  return generate(context.invoked_function_arn.split(":")[4])
+              if event.get("action") == "summary" and re.fullmatch("[a-f0-9]{32}", str(event.get("runId", ""))):
+                  return summary(event["runId"])
+              raise ValueError("Use the generate or summary event in the laboratory guide")
+  MeasurementsQuery:
+    Type: AWS::Logs::QueryDefinition
+    Properties:
+      Name: !Sub '${AWS::StackName}/billed-duration'
+      LogGroupNames: [!Ref ProcessorLogs]
+      QueryString: |
+        fields @timestamp, @requestId, @billedDuration, @memorySize
+        | filter @type = "REPORT"
+        | sort @timestamp desc
+        | limit 100
+  Dashboard:
+    Type: AWS::CloudWatch::Dashboard
+    Properties:
+      DashboardName: !Ref AWS::StackName
+      DashboardBody: !Sub |
+        {"widgets":[{"type":"metric","width":12,"height":6,"properties":{"region":"${AWS::Region}","title":"Processor activity","period":60,"stat":"Sum","metrics":[["AWS/Lambda","Invocations","FunctionName","${Processor}"],["AWS/Lambda","Errors","FunctionName","${Processor}"]]}}]}
+Outputs:
+  GeneratorFunctionName:
+    Value: !Ref Generator
+  ProcessorFunctionName:
+    Value: !Ref Processor
+  ResultsBucketName:
+    Value: !Ref Bucket
+  ProcessorLogGroupName:
+    Value: !Ref ProcessorLogs
+  MeasurementsQueryName:
+    Value: !Sub '${AWS::StackName}/billed-duration'
