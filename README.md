@@ -40,7 +40,7 @@ Este laboratorio cuenta con un sitio de evaluación en [lab13.shareddomain.link]
 
 Durante el laboratorio se procesa el mismo conjunto de archivos en dos pruebas. La primera utiliza la configuración inicial para medir el consumo y comprobar la activación de la alarma. La segunda permite verificar si el ajuste reduce las lecturas sin alterar los resultados. Al iniciar cada prueba, la función de pruebas devuelve un identificador (`runId`). Guardar el de cada ejecución e ingresarlo en el campo correspondiente del evaluador, que lo utiliza para localizar sus mediciones, resultados y logs en la cuenta.
 
-Para comparar los costos, adjuntar las exportaciones de la misma estimación de AWS Pricing Calculator antes y después del ajuste. El evaluador obtiene los subtotales directamente de ambos archivos. Para las dos explicaciones breves utiliza un modelo de lenguaje en la cuenta docente y contrasta las afirmaciones con los datos de las pruebas.
+Para comparar los costos, adjuntar los dos CSV exportados desde AWS Pricing Calculator: uno antes del ajuste y otro después. Los CSV guardados en S3 contienen las mediciones que se utilizan para construir esas estimaciones; no se adjuntan al evaluador. Para las dos explicaciones breves, el evaluador utiliza un modelo de lenguaje en la cuenta docente y contrasta las afirmaciones con los datos de las pruebas.
 
 | Criterio y comprobaciones | Puntos |
 | --- | ---: |
@@ -85,7 +85,7 @@ La alerta debe distinguir un aumento de demanda de un aumento de lecturas por ar
 
 #### 2.1 Definir la métrica de consumo
 
-1. Abrir en **CloudWatch → Log groups** el grupo indicado por `ProcessorLogGroupName` y crear un metric filter desde **Metric filters**
+1. Abrir **CloudWatch → Log Management**. En la lista **Log groups**, seleccionar el grupo indicado por `ProcessorLogGroupName`. Abrir la pestaña **Metric filters** y crear un filtro
 2. Diseñar y probar el patrón con los siguientes registros de ejemplo. Solo deben contribuir los eventos `file_processed` completados que informen una cantidad válida de lecturas. Utilizar los ejemplos en el editor del patrón, sin enviarlos al log group
 
 ```jsonl
@@ -101,7 +101,7 @@ La alerta debe distinguir un aumento de demanda de un aumento de lecturas por ar
 #### 2.2 Configurar la alarma y su notificación
 
 1. Crear el topic SNS Standard `tel351-cmo-alerts` y suscribir una dirección de correo. Confirmar la suscripción desde el mensaje de SNS
-2. Regresar a **Metric filters**, seleccionar el filtro recién creado y elegir **Create alarm**. Esta ruta permite definir la alarma sin buscar la métrica en el catálogo ni generar tráfico para que aparezca
+2. Volver al grupo de la procesadora en **CloudWatch → Log Management**. En la pestaña **Metric filters**, seleccionar `tel351-cmo-storage-reads` y elegir **Create alarm**. Esta ruta permite definir la alarma sin generar tráfico para que la métrica aparezca en el catálogo
 3. Nombrar la alarma `tel351-cmo-storage-reads`. Utilizar períodos de un minuto y elegir la estadística, el umbral y la comparación que permitan detectar un solo archivo con más de una lectura, aunque los demás archivos del período requieran solo una. Configurar la evaluación sobre un período y tratar la ausencia de datos como no constitutiva de alarma
 4. Asociar la acción **In alarm** al topic SNS y dejar las acciones habilitadas. No forzar el estado de la alarma ni publicar muestras artificiales
 
@@ -109,7 +109,7 @@ La alerta debe distinguir un aumento de demanda de un aumento de lecturas por ar
 
 #### 3.1 Obtener la medición inicial
 
-1. Abrir la función indicada en `GeneratorFunctionName` y, en **Test**, crear un evento privado llamado `cmo-generate`
+1. En **Lambda → Functions**, abrir la función cuyo nombre figura en el output `GeneratorFunctionName` y, en **Test**, crear un evento privado llamado `cmo-generate`
 2. Guardar el siguiente evento. Una vez creada la alarma y confirmada la suscripción, ejecutarlo una sola vez:
 
 ```json
@@ -120,7 +120,7 @@ La alerta debe distinguir un aumento de demanda de un aumento de lecturas por ar
 }
 ```
 
-3. Conservar el `runId` y comprobar la cantidad de archivos aceptados
+3. En la respuesta de la función, guardar el valor de `runId` y comprobar que `accepted` sea igual a 5
 4. Crear otro evento privado, llamado `cmo-summary`, con el siguiente contenido:
 
 ```json
@@ -130,20 +130,22 @@ La alerta debe distinguir un aumento de demanda de un aumento de lecturas por ar
 }
 ```
 
-5. Consultar el resumen con el `runId` inicial y comprobar que se completaron los cinco archivos. La respuesta contiene una tabla con una fila por archivo; la misma tabla se puede descargar como `measurements.csv` si se prefiere trabajar en una planilla
+5. Ejecutar `cmo-summary` con el `runId` inicial y comprobar que `completed` sea igual a 5. Las mediciones de cada archivo aparecen en `measurements` y también quedan guardadas en Amazon S3. Si se prefiere trabajar en una planilla, abrir en **Amazon S3 → Buckets** el bucket indicado en el campo `bucket` de la respuesta. En **Objects**, entrar a `runs/<runId>/`, marcar `measurements.csv` y seleccionar **Download**
 
 #### 3.2 Completar el dashboard
 
-Mientras se publican las mediciones, abrir el dashboard `tel351-cmo`. El gráfico de invocaciones y errores ya está configurado. Incorporar dos widgets:
+Mientras se publican las mediciones, abrir `tel351-cmo` en **CloudWatch → Dashboards**. El gráfico de invocaciones y errores ya está configurado. Incorporar dos widgets:
 
 - Un gráfico que muestre el máximo de `StorageReadsPerFile` por minuto en la región del laboratorio
 - Un widget de estado que identifique la alarma `tel351-cmo-storage-reads`
 
-Si la serie todavía no aparece en el selector de métricas, avanzar con la interpretación y el presupuesto y completar el gráfico cuando esté disponible. En **Alarms → History**, identificar la transición a `ALARM` y contrastar el período que la provocó con la hora de la prueba inicial. El evaluador utilizará ese mismo `runId`; no es necesario que la alarma permanezca activa al momento de evaluar.
+Si la serie todavía no aparece en el selector de métricas, avanzar con la interpretación y el presupuesto y completar el gráfico cuando esté disponible. En **CloudWatch → Alarms → All alarms**, seleccionar `tel351-cmo-storage-reads` y abrir **History**. Identificar la transición a `ALARM` y contrastar el período que la provocó con la hora de la prueba inicial. No es necesario que la alarma permanezca activa al momento de evaluar.
 
 #### 3.3 Interpretar la medición inicial
 
-Utilizar la tabla de `summary`. Si `measurementStatus` indica `PARTIAL`, repetir solo la consulta con el mismo `runId`, sin volver a ejecutar `generate`. Una celda vacía indica que el dato aún no está disponible; no equivale a cero. Si persiste una diferencia, utilizar el detalle de invocaciones (`invocations.csv`) y la consulta de Logs Insights indicada por `MeasurementsQueryName` para investigarla.
+Utilizar las filas de `measurements` en la respuesta de `cmo-summary`. Si `measurementStatus` indica `PARTIAL`, repetir solo `cmo-summary` con el mismo `runId`. Si se trabaja en una planilla, descargar el CSV actualizado desde la misma carpeta de S3. Una celda vacía indica que el dato aún no está disponible; no equivale a cero.
+
+Si persiste una diferencia, ubicar el `requestId` de la invocación en `runs/<runId>/invocations.csv`, en el mismo bucket. En **CloudWatch → Logs Insights → Queries → Saved queries**, seleccionar la consulta indicada por `MeasurementsQueryName`, ejecutarla para el intervalo de la prueba y buscar ese mismo `requestId` en los resultados.
 
 | Medición | Interpretación |
 | --- | --- |
@@ -198,11 +200,11 @@ Contabilizar las lecturas de la función procesadora como solicitudes a S3, no c
 
 ### 5. Aplicar una medida de control
 
-1. En la procesadora, abrir **Configuration → Environment variables**. La variable `REUSE_INPUT_AT` permite reutilizar la entrada en memoria en una etapa: `validation`, `summary` o `integrity`. El valor inicial, `none`, mantiene el comportamiento de referencia
+1. En **Lambda → Functions**, abrir la función indicada por `ProcessorFunctionName` y seleccionar **Configuration → Environment variables**. La variable `REUSE_INPUT_AT` permite reutilizar la entrada en memoria en una etapa: `validation`, `summary` o `integrity`. El valor inicial, `none`, mantiene el comportamiento de referencia
 2. A partir de las mediciones iniciales, decidir en qué etapa aplicar el ajuste y anticipar cómo debe cambiar la métrica
 3. Cambiar únicamente el valor de `REUSE_INPUT_AT` y guardar la configuración
-4. Esperar a que finalice la actualización e iniciar la prueba en un nuevo período de la alarma, para distinguir las muestras anteriores de las posteriores al ajuste
-5. Ejecutar `cmo-generate` por segunda vez, conservar el nuevo `runId` y consultar `cmo-summary` con ese identificador
+4. Esperar a que finalice la actualización y comprobar que ya pasó el minuto en que se ejecutó la prueba inicial, para que la alarma registre ambas pruebas en períodos distintos
+5. Volver a la pestaña **Test** de la función indicada por `GeneratorFunctionName` y ejecutar `cmo-generate` una sola vez. Guardar el nuevo `runId`, reemplazar con él el valor de `runId` en el evento `cmo-summary` y ejecutar ese evento. Si se trabaja en una planilla, descargar `measurements.csv` desde la carpeta del **nuevo** `runId` en S3
 6. Comprobar que se completaron todos los archivos y comparar sus resultados por `fileId`
 
 Para cada `fileId`, comprobar que `inputDigest` (hash del archivo de entrada) coincide en ambas pruebas. Luego, comparar `recordsProcessed` y `resultDigest` (hash del resumen): ambos deben mantenerse después del ajuste. El cálculo de los hashes excluye los identificadores y las fechas propios de cada ejecución.
@@ -214,7 +216,7 @@ No modificar código, entradas, memoria, permisos ni mecanismos de registro. No 
 ### 6. Comparar el consumo y el costo estimado
 
 1. Volver a la estimación abierta en AWS Pricing Calculator. A partir de la tabla de la segunda ejecución, actualizar solo los consumos que cambiaron. Mantener la demanda, las tarifas y los demás supuestos del presupuesto inicial
-2. Exportar la estimación actualizada como un segundo CSV. Calcular la diferencia entre el costo mensual inicial y el posterior (`inicial − posterior`), en USD y como porcentaje del inicial, utilizando los totales mensuales en USD de los dos CSV. Un resultado negativo indica un aumento. Si el costo inicial es cero, indicar que no corresponde calcular el porcentaje
+2. En **My estimate → Export → CSV**, guardar la estimación actualizada sin sobrescribir el archivo inicial. Con los totales mensuales de ambos CSV, calcular la diferencia (`inicial − posterior`) en USD y como porcentaje del costo inicial. Un resultado negativo indica un aumento. Si el costo inicial es cero, indicar que no corresponde calcular el porcentaje
 3. Separar la reducción de lecturas observada de las variaciones de duración de Lambda. Una muestra pequeña no permite garantizar que toda diferencia de tiempo provenga de la corrección
 
 El número de lecturas puede disminuir sin que el costo total caiga en la misma proporción. El almacenamiento, las escrituras y las invocaciones pueden mantenerse, y el monitoreo puede representar una parte importante del costo de una aplicación pequeña. No se exige un porcentaje predeterminado de ahorro ni se debe presentar la proyección como un cargo ya registrado por AWS.
