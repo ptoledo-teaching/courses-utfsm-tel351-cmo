@@ -93,7 +93,7 @@ Resources:
         LogFormat: Text
         LogGroup: !Ref ProcessorLogs
       MemorySize: 512
-      Timeout: 15
+      Timeout: 30
       Environment:
         Variables:
           RESULTS_BUCKET: !Ref Bucket
@@ -119,8 +119,8 @@ Resources:
               row = {"runId": run, "fileId": file, "requestId": context.aws_request_id, "storageReads": 0, "bytesRead": 0}
               try:
                   stages = ("validation", "summary", "integrity")
-                  setting, reads = os.environ["REUSE_INPUT_AT"], event["reads"]
-                  if setting not in ("none", *stages) or not isinstance(reads, list) or len(reads) != 3 or any(type(n) is not int or not 0 <= n <= 3 for n in reads):
+                  setting, reader = os.environ["REUSE_INPUT_AT"], event["reader"]
+                  if setting not in ("none", *stages) or reader not in (None, *stages):
                       raise ValueError("Invalid processing configuration")
                   row.update(reuseAt=setting, loadReads=0, validationReads=0, summaryReads=0, integrityReads=0)
 
@@ -134,24 +134,30 @@ Resources:
 
                   body = fetch("load")
 
-                  def source(stage, extra):
-                      data = body
-                      if setting != stage:
-                          for _ in range(extra):
-                              data = fetch(stage)
-                      return data
-
-                  record = json.loads(source("validation", reads[0]))
-                  if record["station"] != file or not record["samples"] or not all(type(x) is int for x in record["samples"]):
+                  document = json.loads(body)
+                  records = document["records"]
+                  if document["station"] != file or not 1 <= len(records) <= 30:
                       raise ValueError("Invalid telemetry")
-                  samples = json.loads(source("summary", reads[1]))["samples"]
-                  digest = hashlib.sha256(source("integrity", reads[2])).hexdigest()
+
+                  def stage_records(stage):
+                      for index, cached in enumerate(records):
+                          if reader == stage and setting != stage:
+                              yield json.loads(fetch(stage))["records"][index]
+                          else:
+                              yield cached
+
+                  for samples in stage_records("validation"):
+                      if not samples or not all(type(x) is int for x in samples):
+                          raise ValueError("Invalid telemetry record")
+                  total = sum(sum(samples) for samples in stage_records("summary"))
+                  checked = {"station": file, "records": list(stage_records("integrity"))}
+                  digest = hashlib.sha256(json.dumps(checked, separators=(",", ":")).encode()).hexdigest()
                   if digest != event["inputDigest"]:
                       raise ValueError("Input checksum mismatch")
-                  summary = {"station": file, "recordsProcessed": len(samples), "total": sum(samples), "inputDigest": digest}
+                  summary = {"station": file, "recordsProcessed": len(records), "total": total, "inputDigest": digest}
                   output = json.dumps(summary, sort_keys=True, separators=(",", ":")).encode()
                   s3.put_object(Bucket=bucket, Key=prefix + f"results/{file}.json", Body=output, ContentType="application/json")
-                  row.update(outcome="COMPLETED", inputBytes=len(body), recordsProcessed=len(samples), inputDigest=digest,
+                  row.update(outcome="COMPLETED", inputBytes=len(body), recordsProcessed=len(records), inputDigest=digest,
                              resultDigest=hashlib.sha256(output).hexdigest(), resultObjectBytes=len(output))
               except Exception:
                   row["outcome"] = "FAILED"
@@ -194,7 +200,7 @@ Resources:
 
           s3 = boto3.client("s3")
           logs = boto3.client("logs")
-          functions = boto3.client("lambda", config=Config(retries={"total_max_attempts": 1}, read_timeout=20))
+          functions = boto3.client("lambda", config=Config(retries={"total_max_attempts": 1}, read_timeout=35))
           bucket = os.environ["RESULTS_BUCKET"]
           files = "ABCDE"
           fields = "runId fileId requestId outcome recordsProcessed inputDigest resultDigest storageReads loadReads validationReads summaryReads integrityReads inputBytes bytesRead resultObjectBytes billedDurationMs memoryMB".split()
@@ -206,19 +212,22 @@ Resources:
 
           def _layout(account, i):
               k = int(hashlib.sha256(account.encode("ascii")).hexdigest(), 16) % 6
-              return (i+1)*(4096+97*k), [int("1020003010"[5*(k%2)+i])*(j==k//2) for j in range(3)]
+              n = (20,0,30,0,0,0,28,0,22,0)[5*(k%2)+i]
+              return (i+1)*(4096+97*k), n or 10, ("validation","summary","integrity")[k//2] if n else None
 
 
           def generate(account):
               run = uuid.uuid4().hex
               prefix = f"runs/{run}/"
-              manifest = {"runId": run, "startMs": int(time.time() * 1000), "rows": []}
+              manifest = {"workloadVersion": 2, "runId": run, "startMs": int(time.time() * 1000), "rows": []}
               for i, file in enumerate(files, 1):
-                  size, reads = _layout(account, i-1)
-                  body = json.dumps({"station": file, "samples": [(i * j) % 997 for j in range(size)]}, separators=(",", ":")).encode()
+                  size, count, reader = _layout(account, i-1)
+                  samples = [(i * j) % 997 for j in range(size)]
+                  records = [samples[j*size//count:(j+1)*size//count] for j in range(count)]
+                  body = json.dumps({"station": file, "records": records}, separators=(",", ":")).encode()
                   put(prefix + f"inputs/{file}.json", body)
                   try:
-                      work = {"runId": run, "fileId": file, "reads": reads, "inputDigest": hashlib.sha256(body).hexdigest()}
+                      work = {"runId": run, "fileId": file, "reader": reader, "inputDigest": hashlib.sha256(body).hexdigest()}
                       response = functions.invoke(FunctionName=os.environ["PROCESSOR"], Payload=json.dumps(work).encode())
                       row = json.load(response["Payload"])
                       if response.get("FunctionError") or row.get("outcome") != "COMPLETED":

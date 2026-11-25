@@ -169,7 +169,7 @@ Proyectar el consumo mensual a partir de las mediciones por archivo de la prueba
 
 | Supuesto | Valor |
 | --- | --- |
-| Demanda mensual | 100.000 archivos nuevos |
+| Demanda mensual | 30 millones de archivos nuevos |
 | Composición de la demanda | Los cinco tipos de archivo de la prueba, en igual proporción |
 | Invocaciones del servicio | Una invocación de la procesadora por archivo |
 | Almacenamiento | S3 Standard, originales y resultados conservados durante 30 días |
@@ -192,7 +192,7 @@ almacenamiento estable en GB = archivos mensuales × promedio de bytes almacenad
 
 El presupuesto calculado en esta sección comprende el procesamiento y almacenamiento del servicio. No incluye la función de pruebas, sus exportaciones, el monitoreo, SNS ni la navegación por consola. Identificarlo como una estimación parcial, no como el costo total de la solución o el monto por pagar.
 
-Contabilizar las lecturas de la función procesadora como solicitudes a S3, no como transferencias de datos hacia Internet. Revisar las condiciones de transferencia aplicables a los servicios en la misma región. Los supuestos de la demanda no autorizan generar 100.000 archivos: el consumo mensual se obtiene por extrapolación.
+Contabilizar las lecturas de la función procesadora como solicitudes a S3, no como transferencias de datos hacia Internet. Revisar las condiciones de transferencia aplicables a los servicios en la misma región. No generar los 30 millones de archivos: el consumo mensual se obtiene por extrapolación.
 
 **En el evaluador:** ingresar las cantidades mensuales proyectadas: invocaciones, GB-segundo, solicitudes GET, solicitudes PUT y GB de almacenamiento. Adjuntar el CSV inicial de AWS Pricing Calculator. Utilizar cantidades sin redondear en los cálculos intermedios. El evaluador compara por separado los subtotales mensuales de Lambda y S3.
 
